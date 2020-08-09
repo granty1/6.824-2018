@@ -1,7 +1,11 @@
 package mapreduce
 
 import (
+	"encoding/json"
 	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"os"
 )
 
 func doMap(
@@ -53,6 +57,33 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+
+	// 1. read file
+	data, err := ioutil.ReadFile(inFile)
+	if err != nil {
+		log.Fatal("read file error:", err)
+	}
+	// 3. mapf() => []KeyValue
+	kvs := mapF(inFile, string(data))
+	// 4. for range []KeyValue => write into file : mrtmp.xxx-0-0
+	for _, kv := range kvs {
+		if write := func() error {
+			f, err := os.OpenFile(reduceName(jobName, mapTask, ihash(kv.Key)%nReduce),
+				os.O_CREATE|os.O_RDWR|os.O_APPEND,
+				os.ModePerm)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			dec := json.NewEncoder(f)
+			if err := dec.Encode(&kv); err != nil {
+				return err
+			}
+			return nil
+		}; write() != nil {
+			log.Fatal(write())
+		}
+	}
 }
 
 func ihash(s string) int {
