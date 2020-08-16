@@ -143,6 +143,24 @@ func (rf *Raft) latestLog() (int, int) {
 	return latestLog.Index, latestLog.Term
 }
 
+func (rf *Raft) preLog() (int, int) {
+	if len(rf.log) < 2 {
+		return 0, 0
+	}
+	preLog := rf.log[len(rf.log)-2]
+	return preLog.Index, preLog.Term
+}
+
+func (rf *Raft) logEntries(nextIndex int) []LogEntry {
+	var logs []LogEntry
+	for _, v := range rf.log {
+		if v.Index >= nextIndex {
+			logs = append(logs, v)
+		}
+	}
+	return logs
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -185,7 +203,9 @@ type AppendEntriesReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.heart <- Done
 	index, term := rf.latestLog()
-	if rf.votedFor == -1 && index == args.LastLogIndex && term == args.LastLogTerm {
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+	} else if rf.votedFor == -1 && index <= args.LastLogIndex && term <= args.LastLogTerm {
 		reply.VoteGranted = true
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
@@ -254,7 +274,18 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
+
+	if term, isLeader = rf.GetState(); isLeader {
+		index, term = rf.latestLog()
+		index++
+		rf.log = append(rf.log, LogEntry{
+			Term:    rf.currentTerm,
+			Command: command,
+			Index:   index,
+		})
+		rf.commitIndex++
+	}
 
 	// Your code here (2B).
 
@@ -269,6 +300,86 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+}
+
+func (rf *Raft) broadcastVoteRequest() {
+	// 没有收到任何心跳包
+	// 发起leader竞选
+	// 投当前server的票数
+	var votedMe int
+	// 1.增加自己的任期
+	rf.currentTerm++
+	// 2.转为候选者状态，并投自己一票
+	rf.status = Candidater
+	rf.votedFor = rf.me
+	votedMe++
+	// 3.并行发送RequestVote
+	for i := range rf.peers {
+		if i != rf.me {
+			go func(server int) {
+				index, term := rf.latestLog()
+				var reply RequestVoteReply
+				if success := rf.sendRequestVote(server, &RequestVoteArgs{
+					Term:         rf.currentTerm,
+					CandidateId:  rf.me,
+					LastLogIndex: index,
+					LastLogTerm:  term,
+				}, &reply); success {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					// 同意投票
+					if reply.VoteGranted {
+						votedMe++
+					} else {
+						if reply.Term > rf.currentTerm {
+							rf.status = Follower
+							rf.currentTerm = reply.Term
+						}
+					}
+					// 大于大多数机器通过
+					if votedMe >= (len(rf.peers)+1)/2 {
+						// 自己成为leader，选举结束
+						rf.status = Leader
+						rf.electionDone <- Done
+					}
+				}
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft) broadcastAppendEntries() {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	for {
+		select {
+		case <-ticker.C:
+			for i := range rf.peers {
+				if i != rf.me {
+					go func(server int) {
+						var args AppendEntriesArgs
+						preIndex, preTerm := rf.preLog()
+						args = AppendEntriesArgs{
+							Term:         rf.currentTerm,
+							Leader:       rf.me,
+							PrevLogIndex: preIndex,
+							PrevLogTerm:  preTerm,
+							Entries:      rf.logEntries(rf.nextIndex[server]),
+							LeaderCommit: rf.commitIndex,
+						}
+						var reply AppendEntriesReply
+						if ok := rf.sendAppendEntries(server, &args, &reply); ok {
+							if reply.Success {
+								rf.nextIndex[server]++
+							} else {
+								rf.currentTerm = reply.Term
+								rf.status = Follower
+							}
+						}
+					}(i)
+				}
+			}
+		}
+	}
 }
 
 //
@@ -299,44 +410,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			select {
 			case <-rf.heart:
 			case <-ticker().C:
-				// 没有收到任何心跳包
-				// 发起leader竞选
-				// 投当前server的票数
-				var votedMe int
-				// 1.增加自己的任期
-				rf.currentTerm++
-				// 2.转为候选者状态，并投自己一票
-				rf.status = Candidater
-				rf.votedFor = rf.me
-				votedMe++
-				// 3.并行发送RequestVote
-				for i := range rf.peers {
-					if i != rf.me {
-						go func(server int) {
-							index, term := rf.latestLog()
-							var reply RequestVoteReply
-							if success := rf.sendRequestVote(server, &RequestVoteArgs{
-								Term:         rf.currentTerm,
-								CandidateId:  rf.me,
-								LastLogIndex: index,
-								LastLogTerm:  term,
-							}, &reply); success {
-								rf.mu.Lock()
-								defer rf.mu.Unlock()
-								// 同意投票
-								if reply.VoteGranted {
-									votedMe++
-								}
-								// 大于大多数机器通过
-								if votedMe >= (len(rf.peers)+1)/2 {
-									// 自己成为leader，选举结束
-									rf.status = Leader
-									rf.electionDone <- Done
-								}
-							}
-						}(i)
-					}
-				}
+				rf.broadcastVoteRequest()
 				// 等待election结束
 				select {
 				case <-rf.electionDone:
@@ -352,35 +426,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						}
 						rf.matchIndex = make([]int, len(peers))
 						// leader发心跳包
-						go func() {
-							ticker := time.NewTicker(10 * time.Millisecond)
-							for {
-								select {
-								case <-ticker.C:
-									for i := range rf.peers {
-										if i != rf.me {
-											go func(server int) {
-												args := AppendEntriesArgs{
-													Term:         rf.currentTerm,
-													Leader:       rf.me,
-													PrevLogIndex: 0,
-													PrevLogTerm:  0,
-													Entries:      nil,
-													LeaderCommit: rf.commitIndex,
-												}
-												var reply AppendEntriesReply
-												if ok := rf.sendAppendEntries(server, &args, &reply); ok {
-
-												}
-											}(i)
-										}
-									}
-								}
-							}
-						}()
-						return
-					} else {
-						goto Wait
+						go rf.broadcastAppendEntries()
+						break Wait
 					}
 				case <-ticker().C:
 				}
