@@ -244,14 +244,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	rf.change(Follower)
 	defer rf.mu.Unlock()
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.term() {
 		reply.Success = false
 		reply.Term = args.Term
-	} else if args.Term > rf.currentTerm {
+	} else if args.Term > rf.term() {
 		rf.currentTerm = args.Term
 		reply.Success = true
+		rf.change(Follower)
 	} else {
 		reply.Success = true
 	}
@@ -346,7 +346,7 @@ func (rf *Raft) Kill() {
 
 func (rf *Raft) broadcastVoteRequest() {
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
+		Term:        rf.term(),
 		CandidateId: rf.me,
 	}
 	for i := range rf.peers {
@@ -361,7 +361,7 @@ func (rf *Raft) broadcastVoteRequest() {
 				if reply.VoteGranted {
 					rf.votedCount++
 				} else {
-					if reply.Term > rf.currentTerm {
+					if reply.Term > rf.term() {
 						rf.currentTerm = reply.Term
 						rf.change(Follower)
 					}
@@ -375,7 +375,7 @@ func (rf *Raft) broadcastVoteRequest() {
 
 func (rf *Raft) broadcastAppendEntries() {
 	args := AppendEntriesArgs{
-		Term:   rf.currentTerm,
+		Term:   rf.term(),
 		Leader: rf.me,
 	}
 	for i := range rf.peers {
@@ -390,7 +390,7 @@ func (rf *Raft) broadcastAppendEntries() {
 				if reply.Success {
 
 				} else {
-					if reply.Term > rf.currentTerm {
+					if reply.Term > rf.term() {
 						rf.currentTerm = reply.Term
 						rf.change(Follower)
 					}
