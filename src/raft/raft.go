@@ -245,9 +245,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	//rf.heart <- Done
-	//rf.electionDone <- Done
-	//rf.status = Follower
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
@@ -350,49 +347,7 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) broadcastVoteRequest() {
-	//// 没有收到任何心跳包
-	//// 发起leader竞选
-	//// 投当前server的票数
-	//var votedMe int
-	//// 1.增加自己的任期
-	//rf.currentTerm++
-	//// 2.转为候选者状态，并投自己一票
-	//rf.status = Candidater
-	//rf.votedFor = rf.me
-	//votedMe++
-	//// 3.并行发送RequestVote
-	//for i := range rf.peers {
-	//	if i != rf.me {
-	//		go func(server int) {
-	//			index, term := rf.latestLog()
-	//			var reply RequestVoteReply
-	//			if success := rf.sendRequestVote(server, &RequestVoteArgs{
-	//				Term:         rf.currentTerm,
-	//				CandidateId:  rf.me,
-	//				LastLogIndex: index,
-	//				LastLogTerm:  term,
-	//			}, &reply); success {
-	//				rf.mu.Lock()
-	//				defer rf.mu.Unlock()
-	//				// 同意投票
-	//				if reply.VoteGranted {
-	//					votedMe++
-	//				} else {
-	//					if reply.Term > rf.currentTerm {
-	//						rf.status = Follower
-	//						rf.currentTerm = reply.Term
-	//					}
-	//				}
-	//				// 大于大多数机器通过
-	//				if votedMe >= (len(rf.peers)+1)/2 {
-	//					// 自己成为leader，选举结束
-	//					rf.status = Leader
-	//					rf.electionDone <- Done
-	//				}
-	//			}
-	//		}(i)
-	//	}
-	//}
+	fmt.Println("start election")
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
@@ -422,37 +377,6 @@ func (rf *Raft) broadcastVoteRequest() {
 }
 
 func (rf *Raft) broadcastAppendEntries() {
-	//ticker := time.NewTicker(10 * time.Millisecond)
-	//for {
-	//	select {
-	//	case <-ticker.C:
-	//		for i := range rf.peers {
-	//			if i != rf.me {
-	//				go func(server int) {
-	//					var args AppendEntriesArgs
-	//					preIndex, preTerm := rf.preLog()
-	//					args = AppendEntriesArgs{
-	//						Term:         rf.currentTerm,
-	//						Leader:       rf.me,
-	//						PrevLogIndex: preIndex,
-	//						PrevLogTerm:  preTerm,
-	//						Entries:      rf.logEntries(rf.nextIndex[server]),
-	//						LeaderCommit: rf.commitIndex,
-	//					}
-	//					var reply AppendEntriesReply
-	//					if ok := rf.sendAppendEntries(server, &args, &reply); ok {
-	//						if reply.Success {
-	//							rf.nextIndex[server]++
-	//						} else {
-	//							rf.currentTerm = reply.Term
-	//							rf.status = Follower
-	//						}
-	//					}
-	//				}(i)
-	//			}
-	//		}
-	//	}
-	//}
 	args := AppendEntriesArgs{
 		Term:   rf.currentTerm,
 		Leader: rf.me,
@@ -483,7 +407,7 @@ func (rf *Raft) election() {
 	rf.incrementTerm()
 	rf.votedFor = rf.me
 	rf.votedCount++
-	// TODO reset timer
+	rf.timer.Reset(randDuration())
 	rf.broadcastVoteRequest()
 }
 
@@ -492,6 +416,7 @@ func (rf *Raft) start() {
 	for {
 		switch rf.state {
 		case Follower:
+			fmt.Printf("[%d] follower\n", rf.me)
 			select {
 			case <-rf.voteChannel:
 				rf.timer.Reset(randDuration())
@@ -503,6 +428,7 @@ func (rf *Raft) start() {
 				rf.mu.Unlock()
 			}
 		case Candidater:
+			fmt.Printf("[%d] candidater\n", rf.me)
 			rf.mu.Lock()
 			select {
 			case <-rf.appendChannel:
@@ -517,6 +443,7 @@ func (rf *Raft) start() {
 			}
 			rf.mu.Unlock()
 		case Leader:
+			fmt.Printf("[%d] leader\n", rf.me)
 			rf.broadcastAppendEntries()
 			time.Sleep(AppendEntriesInterval)
 		}
@@ -536,7 +463,7 @@ func (rf *Raft) change(state int) {
 	}
 	rf.state = state
 	tags := []string{"Follower", "Candidater", "Leader"}
-	fmt.Printf("[%d] %s change to %s", rf.me, tags[lastState], tags[state])
+	fmt.Printf("[%d] %s change to %s\n", rf.me, tags[lastState], tags[state])
 }
 
 func randDuration() time.Duration {
