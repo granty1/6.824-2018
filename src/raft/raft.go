@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 import "labrpc"
@@ -33,7 +34,7 @@ const (
 	Candidater
 	Leader
 
-	AppendEntriesInterval = 100 * time.Millisecond
+	AppendEntriesInterval = 10 * time.Millisecond
 )
 
 //
@@ -65,11 +66,11 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm int
+	currentTerm int32
 	votedFor    int
 	votedCount  int
 	log         []LogEntry
-	state       int
+	state       int32
 
 	timer *time.Timer
 
@@ -95,7 +96,7 @@ type LogEntry struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return rf.currentTerm, rf.is(Leader)
+	return int(rf.currentTerm), rf.is(Leader)
 }
 
 //
@@ -162,23 +163,20 @@ func (rf *Raft) readPersist(data []byte) {
 //	return logs
 //}
 
-func (rf *Raft) term() int {
-	rf.mu.Lock()
-	defer rf.mu.Lock()
-	return rf.currentTerm
+func (rf *Raft) term() int32 {
+	return atomic.LoadInt32(&rf.currentTerm)
 }
 
-func (rf *Raft) incrementTerm() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.currentTerm++
-	return rf.currentTerm
+func (rf *Raft) states() int32 {
+	return atomic.LoadInt32(&rf.state)
 }
 
-func (rf *Raft) is(state int) bool {
-	rf.mu.Lock()
-	rf.mu.Unlock()
-	return rf.state == state
+func (rf *Raft) incrementTerm() int32 {
+	return atomic.AddInt32(&rf.currentTerm, 1)
+}
+
+func (rf *Raft) is(state int32) bool {
+	return rf.states() == state
 }
 
 //
@@ -187,7 +185,7 @@ func (rf *Raft) is(state int) bool {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
+	Term        int32
 	CandidateId int
 	//LastLogIndex int
 	//LastLogTerm  int
@@ -199,12 +197,12 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
+	Term        int32
 	VoteGranted bool
 }
 
 type AppendEntriesArgs struct {
-	Term   int
+	Term   int32
 	Leader int
 	//PrevLogIndex int
 	//PrevLogTerm  int
@@ -213,7 +211,7 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
+	Term    int32
 	Success bool
 }
 
@@ -246,6 +244,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	rf.change(Follower)
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -253,7 +252,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		reply.Success = true
-		rf.change(Follower)
 	} else {
 		reply.Success = true
 	}
@@ -347,7 +345,6 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) broadcastVoteRequest() {
-	fmt.Println("start election")
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
@@ -414,9 +411,8 @@ func (rf *Raft) election() {
 func (rf *Raft) start() {
 	rf.timer = time.NewTimer(randDuration())
 	for {
-		switch rf.state {
+		switch atomic.LoadInt32(&rf.state) {
 		case Follower:
-			fmt.Printf("[%d] follower\n", rf.me)
 			select {
 			case <-rf.voteChannel:
 				rf.timer.Reset(randDuration())
@@ -428,7 +424,6 @@ func (rf *Raft) start() {
 				rf.mu.Unlock()
 			}
 		case Candidater:
-			fmt.Printf("[%d] candidater\n", rf.me)
 			rf.mu.Lock()
 			select {
 			case <-rf.appendChannel:
@@ -443,27 +438,29 @@ func (rf *Raft) start() {
 			}
 			rf.mu.Unlock()
 		case Leader:
-			fmt.Printf("[%d] leader\n", rf.me)
 			rf.broadcastAppendEntries()
 			time.Sleep(AppendEntriesInterval)
 		}
 	}
 }
 
-func (rf *Raft) change(state int) {
+func (rf *Raft) change(state int32) {
 	if rf.is(state) {
 		return
 	}
-	lastState := rf.state
+	//lastState := rf.state
 	switch state {
 	case Follower:
+		rf.state = state
 		rf.votedFor = -1
 	case Candidater:
+		rf.state = state
 		rf.election()
+	case Leader:
+		rf.state = state
 	}
-	rf.state = state
-	tags := []string{"Follower", "Candidater", "Leader"}
-	fmt.Printf("[%d] %s change to %s\n", rf.me, tags[lastState], tags[state])
+	//tags := []string{"Follower", "Candidater", "Leader"}
+	//fmt.Printf("[%d] %s change to %s\n", rf.me, tags[lastState], tags[state])
 }
 
 func randDuration() time.Duration {
