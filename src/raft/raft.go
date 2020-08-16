@@ -17,13 +17,24 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
+)
 import "labrpc"
 
 // import "bytes"
 // import "labgob"
 
+const (
+	Follower = iota
+	Candidater
+	Leader
 
+	Done = 1
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -54,19 +65,37 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
 
+	status int
+	leader int
+
+	commitIndex int
+	lastApplied int
+
+	// leader
+	// 每次选举后重新初始化
+	nextIndex  []int
+	matchIndex []int
+
+	heart        chan int
+	electionDone chan int
+}
+
+type LogEntry struct {
+	Term    int
+	Command interface{}
+	Index   int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return rf.currentTerm, rf.status == Leader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +112,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,8 +135,13 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
+func (rf *Raft) latestLog() (int, int) {
+	if len(rf.log) == 0 {
+		return 0, 0
+	}
+	latestLog := rf.log[len(rf.log)-1]
+	return latestLog.Index, latestLog.Term
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -116,6 +149,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -124,13 +161,41 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	Leader       int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	rf.heart <- Done
+	index, term := rf.latestLog()
+	if rf.votedFor == -1 && index == args.LastLogIndex && term == args.LastLogTerm {
+		reply.VoteGranted = true
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateId
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.heart <- Done
+	rf.electionDone <- Done
+	rf.status = Follower
 }
 
 //
@@ -167,6 +232,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -188,7 +257,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -220,12 +288,112 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.votedFor = -1
+	rf.heart = make(chan int)
+	rf.electionDone = make(chan int)
+	rf.status = Follower
 	// Your initialization code here (2A, 2B, 2C).
+	go func() {
+	Wait:
+		for {
+			select {
+			case <-rf.heart:
+			case <-ticker().C:
+				// 没有收到任何心跳包
+				// 发起leader竞选
+				// 投当前server的票数
+				var votedMe int
+				// 1.增加自己的任期
+				rf.currentTerm++
+				// 2.转为候选者状态，并投自己一票
+				rf.status = Candidater
+				rf.votedFor = rf.me
+				votedMe++
+				// 3.并行发送RequestVote
+				for i := range rf.peers {
+					if i != rf.me {
+						go func(server int) {
+							index, term := rf.latestLog()
+							var reply RequestVoteReply
+							if success := rf.sendRequestVote(server, &RequestVoteArgs{
+								Term:         rf.currentTerm,
+								CandidateId:  rf.me,
+								LastLogIndex: index,
+								LastLogTerm:  term,
+							}, &reply); success {
+								rf.mu.Lock()
+								defer rf.mu.Unlock()
+								// 同意投票
+								if reply.VoteGranted {
+									votedMe++
+								}
+								// 大于大多数机器通过
+								if votedMe >= (len(rf.peers)+1)/2 {
+									// 自己成为leader，选举结束
+									rf.status = Leader
+									rf.electionDone <- Done
+								}
+							}
+						}(i)
+					}
+				}
+				// 等待election结束
+				select {
+				case <-rf.electionDone:
+					rf.votedFor = -1
+					rf.leader = -1
+					if rf.status == Leader {
+						fmt.Printf("[%d] become leader\n", rf.me)
+						// 重新初始化变量
+						rf.nextIndex = make([]int, len(peers))
+						for i := range rf.nextIndex {
+							index, _ := rf.latestLog()
+							rf.nextIndex[i] = index + 1
+						}
+						rf.matchIndex = make([]int, len(peers))
+						// leader发心跳包
+						go func() {
+							ticker := time.NewTicker(10 * time.Millisecond)
+							for {
+								select {
+								case <-ticker.C:
+									for i := range rf.peers {
+										if i != rf.me {
+											go func(server int) {
+												args := AppendEntriesArgs{
+													Term:         rf.currentTerm,
+													Leader:       rf.me,
+													PrevLogIndex: 0,
+													PrevLogTerm:  0,
+													Entries:      nil,
+													LeaderCommit: rf.commitIndex,
+												}
+												var reply AppendEntriesReply
+												if ok := rf.sendAppendEntries(server, &args, &reply); ok {
+
+												}
+											}(i)
+										}
+									}
+								}
+							}
+						}()
+						return
+					} else {
+						goto Wait
+					}
+				case <-ticker().C:
+				}
+			}
+		}
+	}()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-
 	return rf
+}
+
+func ticker() *time.Ticker {
+	return time.NewTicker(time.Duration(rand.Int()%15+15) * 10 * time.Millisecond)
 }
