@@ -136,14 +136,14 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-//func (rf *Raft) latestLog() (int, int) {
-//	if len(rf.log) == 0 {
-//		return 0, 0
-//	}
-//	latestLog := rf.log[len(rf.log)-1]
-//	return latestLog.Index, latestLog.Term
-//}
-//
+func (rf *Raft) latestLog() (int, int) {
+	if len(rf.log) == 0 {
+		return 0, 0
+	}
+	latestLog := rf.log[len(rf.log)-1]
+	return latestLog.Index, latestLog.Term
+}
+
 //func (rf *Raft) preLog() (int, int) {
 //	if len(rf.log) < 2 {
 //		return 0, 0
@@ -201,12 +201,12 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term   int32
-	Leader int
-	//PrevLogIndex int
-	//PrevLogTerm  int
-	//Entries      []LogEntry
-	//LeaderCommit int
+	Term         int32
+	Leader       int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -317,18 +317,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := false
 
-	//if term, isLeader = rf.GetState(); isLeader {
-	//	index, term = rf.latestLog()
-	//	index++
-	//	rf.log = append(rf.log, LogEntry{
-	//		Term:    rf.currentTerm,
-	//		Command: command,
-	//		Index:   index,
-	//	})
-	//	rf.commitIndex++
-	//}
-	//
-	//// Your code here (2B).
+	// Your code here (2B).
+	if term, isLeader = rf.GetState(); isLeader {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		index, term = rf.latestLog()
+		rf.matchIndex[rf.me] = index
+		rf.nextIndex[rf.me] = index + 1
+		rf.log = append(rf.log, LogEntry{
+			Term:    term,
+			Command: command,
+			Index:   index,
+		})
+		rf.persist()
+		rf.broadcastAppendEntries()
+	}
 
 	return index, term, isLeader
 }
@@ -372,15 +375,25 @@ func (rf *Raft) broadcastVoteRequest() {
 }
 
 func (rf *Raft) broadcastAppendEntries() {
-	args := AppendEntriesArgs{
-		Term:   rf.term(),
-		Leader: rf.me,
-	}
+
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go func(server int) {
+			rf.mu.Lock()
+			preLogIndex := rf.nextIndex[server] - 1
+			entries := make([]LogEntry, len(rf.log[preLogIndex+1:]))
+			copy(entries, rf.log[preLogIndex+1:])
+			args := AppendEntriesArgs{
+				Term:         rf.term(),
+				Leader:       rf.me,
+				PrevLogIndex: preLogIndex,
+				PrevLogTerm:  rf.log[preLogIndex].Term,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.mu.Unlock()
 			var reply AppendEntriesReply
 			if rf.is(Leader) && rf.sendAppendEntries(server, &args, &reply) {
 				rf.mu.Lock()
@@ -455,6 +468,14 @@ func (rf *Raft) change(state int32) {
 		rf.election()
 	case Leader:
 		rf.state = state
+		// init nextIndex[]
+		for i := range rf.nextIndex {
+			rf.nextIndex[i] = len(rf.log)
+		}
+		for i := range rf.matchIndex {
+			rf.matchIndex[i] = len(rf.log)
+		}
+		rf.broadcastAppendEntries()
 	}
 }
 
@@ -484,6 +505,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.voteChannel = make(chan struct{})
 	rf.appendChannel = make(chan struct{})
+	rf.log = make([]LogEntry, 1)
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		// initialized to leader last log index + 1
+		rf.nextIndex[i] = len(rf.log)
+	}
+	rf.matchIndex = make([]int, len(rf.peers))
 	// Your initialization code here (2A, 2B, 2C).
 	go rf.start()
 	// initialize from state persisted before a crash
