@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -367,7 +366,6 @@ func (rf *Raft) broadcastVoteRequest() {
 					}
 				}
 			} else {
-				fmt.Printf("[%d] send vote request fail\n", server)
 			}
 		}(i)
 	}
@@ -403,7 +401,7 @@ func (rf *Raft) broadcastAppendEntries() {
 func (rf *Raft) election() {
 	rf.incrementTerm()
 	rf.votedFor = rf.me
-	rf.votedCount++
+	rf.votedCount = 1
 	rf.timer.Reset(randDuration())
 	rf.broadcastVoteRequest()
 }
@@ -432,7 +430,7 @@ func (rf *Raft) start() {
 				rf.timer.Reset(randDuration())
 				rf.election()
 			default:
-				if rf.votedCount > (len(rf.peers)+1)/2 {
+				if rf.votedCount >= (len(rf.peers)+1)/2 {
 					rf.change(Leader)
 				}
 			}
@@ -448,7 +446,6 @@ func (rf *Raft) change(state int32) {
 	if rf.is(state) {
 		return
 	}
-	//lastState := rf.state
 	switch state {
 	case Follower:
 		rf.state = state
@@ -459,8 +456,6 @@ func (rf *Raft) change(state int32) {
 	case Leader:
 		rf.state = state
 	}
-	//tags := []string{"Follower", "Candidater", "Leader"}
-	//fmt.Printf("[%d] %s change to %s\n", rf.me, tags[lastState], tags[state])
 }
 
 func randDuration() time.Duration {
