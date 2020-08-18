@@ -74,7 +74,6 @@ type Raft struct {
 	timer *time.Timer
 
 	voteChannel   chan struct{}
-	appendChannel chan struct{}
 
 	commitIndex int
 	lastApplied int
@@ -83,6 +82,8 @@ type Raft struct {
 	// 每次选举后重新初始化
 	nextIndex  []int
 	matchIndex []int
+
+	applyCh chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -247,16 +248,48 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.term() {
 		reply.Success = false
 		reply.Term = args.Term
-	} else if args.Term > rf.term() {
-		rf.currentTerm = args.Term
-		reply.Success = true
-		rf.change(Follower)
-	} else {
-		reply.Success = true
+		return
 	}
-	go func() {
-		rf.appendChannel <- struct{}{}
-	}()
+	if args.Term > rf.term() {
+		rf.currentTerm = args.Term
+		rf.change(Follower)
+	}
+
+	rf.timer.Reset(randDuration())
+
+	if len(rf.log) < args.PrevLogIndex+1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.term()
+		return
+	}
+
+	unmatch_id := -1
+	for id := range args.Entries {
+		if len(rf.log) < args.PrevLogIndex+id+2 || rf.log[args.PrevLogIndex+1+id].Term != args.Entries[id].Term {
+			unmatch_id = id
+			break
+		}
+	}
+
+	if unmatch_id != -1 {
+		// preLogIndex and preLogTerm 匹配的上
+		rf.log = rf.log[:args.PrevLogIndex+1+unmatch_id]
+		rf.log = append(rf.log, args.Entries[unmatch_id:]...)
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		lastLogIndex := len(rf.log) - 1
+		if args.LeaderCommit <= lastLogIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastLogIndex
+		}
+		//TODO apply
+	}
+	reply.Success = true
+	//go func() {
+	//	rf.appendChannel <- struct{}{}
+	//}()
 }
 
 //
@@ -369,13 +402,13 @@ func (rf *Raft) broadcastVoteRequest() {
 					}
 				}
 			} else {
+				//TODO retry ?
 			}
 		}(i)
 	}
 }
 
 func (rf *Raft) broadcastAppendEntries() {
-
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -399,11 +432,29 @@ func (rf *Raft) broadcastAppendEntries() {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.Success {
+					rf.matchIndex[server] = preLogIndex + len(entries)
+					rf.nextIndex[server] = rf.matchIndex[server] + 1
 
+					for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
+						count := 0
+						for _, matchIndex := range rf.matchIndex {
+							if matchIndex > i {
+								count++
+							}
+						}
+						if count > len(rf.peers)/2 {
+							rf.commitIndex = i
+							//TODO push to apply channel
+							break
+						}
+					}
 				} else {
 					if reply.Term > rf.term() {
 						rf.currentTerm = reply.Term
 						rf.change(Follower)
+					} else {
+						//TODO log unmatch
+						rf.nextIndex[server] -= 1
 					}
 				}
 			}
@@ -427,7 +478,7 @@ func (rf *Raft) start() {
 			select {
 			case <-rf.voteChannel:
 				rf.timer.Reset(randDuration())
-			case <-rf.appendChannel:
+			case <-rf.applyCh:
 				rf.timer.Reset(randDuration())
 			case <-rf.timer.C:
 				rf.mu.Lock()
@@ -437,7 +488,7 @@ func (rf *Raft) start() {
 		case Candidater:
 			rf.mu.Lock()
 			select {
-			case <-rf.appendChannel:
+			case <-rf.applyCh:
 				rf.change(Follower)
 			case <-rf.timer.C:
 				rf.timer.Reset(randDuration())
@@ -501,10 +552,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	rf.applyCh = applyCh
 	rf.state = Follower
 	rf.votedFor = -1
 	rf.voteChannel = make(chan struct{})
-	rf.appendChannel = make(chan struct{})
 	rf.log = make([]LogEntry, 1)
 	rf.nextIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
