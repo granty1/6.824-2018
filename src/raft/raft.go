@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -73,7 +74,7 @@ type Raft struct {
 
 	timer *time.Timer
 
-	voteChannel   chan struct{}
+	voteChannel chan struct{}
 
 	commitIndex int
 	lastApplied int
@@ -89,7 +90,6 @@ type Raft struct {
 type LogEntry struct {
 	Term    int
 	Command interface{}
-	Index   int
 }
 
 // return currentTerm and whether this server
@@ -135,14 +135,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-}
-
-func (rf *Raft) latestLog() (int, int) {
-	if len(rf.log) == 0 {
-		return 0, 0
-	}
-	latestLog := rf.log[len(rf.log)-1]
-	return latestLog.Index, latestLog.Term
 }
 
 //func (rf *Raft) preLog() (int, int) {
@@ -254,7 +246,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.change(Follower)
 	}
-
+	if rf.is(Candidater) {
+		rf.change(Follower)
+	}
 	rf.timer.Reset(randDuration())
 
 	if len(rf.log) < args.PrevLogIndex+1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -275,6 +269,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// preLogIndex and preLogTerm 匹配的上
 		rf.log = rf.log[:args.PrevLogIndex+1+unmatch_id]
 		rf.log = append(rf.log, args.Entries[unmatch_id:]...)
+		fmt.Printf("[%d] append log: %+v\n", rf.me, args.Entries[unmatch_id:])
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -284,12 +279,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = lastLogIndex
 		}
-		//TODO apply
+		rf.apply()
+		fmt.Printf("[%d] commitIndex:%d\n", rf.me, rf.commitIndex)
 	}
 	reply.Success = true
-	//go func() {
-	//	rf.appendChannel <- struct{}{}
-	//}()
+}
+
+func (rf *Raft) apply() {
+	if rf.commitIndex > rf.lastApplied {
+		go func(start_id int, entries []LogEntry) {
+			for i, v := range entries {
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      v.Command,
+					CommandIndex: start_id + i,
+				}
+
+				rf.applyCh <- msg
+
+				rf.mu.Lock()
+				rf.lastApplied = msg.CommandIndex
+				rf.mu.Unlock()
+			}
+		}(rf.lastApplied+1, rf.log[rf.lastApplied+1:rf.commitIndex+1])
+	}
 }
 
 //
@@ -354,15 +367,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if term, isLeader = rf.GetState(); isLeader {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		index, term = rf.latestLog()
+		index = len(rf.log)
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
 		rf.log = append(rf.log, LogEntry{
 			Term:    term,
 			Command: command,
-			Index:   index,
 		})
-		rf.persist()
 		rf.broadcastAppendEntries()
 	}
 
@@ -418,8 +429,11 @@ func (rf *Raft) broadcastAppendEntries() {
 			preLogIndex := rf.nextIndex[server] - 1
 			entries := make([]LogEntry, len(rf.log[preLogIndex+1:]))
 			copy(entries, rf.log[preLogIndex+1:])
+			if preLogIndex < 0 {
+				fmt.Printf("[%d] preIndex is %d\n", rf.me, preLogIndex)
+			}
 			args := AppendEntriesArgs{
-				Term:         rf.term(),
+				Term:         rf.currentTerm,
 				Leader:       rf.me,
 				PrevLogIndex: preLogIndex,
 				PrevLogTerm:  rf.log[preLogIndex].Term,
@@ -438,18 +452,18 @@ func (rf *Raft) broadcastAppendEntries() {
 					for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
 						count := 0
 						for _, matchIndex := range rf.matchIndex {
-							if matchIndex > i {
+							if matchIndex >= i {
 								count++
 							}
 						}
 						if count > len(rf.peers)/2 {
 							rf.commitIndex = i
-							//TODO push to apply channel
+							rf.apply()
 							break
 						}
 					}
 				} else {
-					if reply.Term > rf.term() {
+					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.change(Follower)
 					} else {
@@ -465,6 +479,7 @@ func (rf *Raft) broadcastAppendEntries() {
 func (rf *Raft) election() {
 	rf.incrementTerm()
 	rf.votedFor = rf.me
+
 	rf.votedCount = 1
 	rf.timer.Reset(randDuration())
 	rf.broadcastVoteRequest()
@@ -478,8 +493,6 @@ func (rf *Raft) start() {
 			select {
 			case <-rf.voteChannel:
 				rf.timer.Reset(randDuration())
-			case <-rf.applyCh:
-				rf.timer.Reset(randDuration())
 			case <-rf.timer.C:
 				rf.mu.Lock()
 				rf.change(Candidater)
@@ -488,8 +501,6 @@ func (rf *Raft) start() {
 		case Candidater:
 			rf.mu.Lock()
 			select {
-			case <-rf.applyCh:
-				rf.change(Follower)
 			case <-rf.timer.C:
 				rf.timer.Reset(randDuration())
 				rf.election()
@@ -526,6 +537,7 @@ func (rf *Raft) change(state int32) {
 		for i := range rf.matchIndex {
 			rf.matchIndex[i] = len(rf.log)
 		}
+		fmt.Printf("[%d] change to [Leader]\n", rf.me)
 		rf.broadcastAppendEntries()
 	}
 }
