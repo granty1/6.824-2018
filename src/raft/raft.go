@@ -429,9 +429,7 @@ func (rf *Raft) broadcastAppendEntries() {
 			preLogIndex := rf.nextIndex[server] - 1
 			entries := make([]LogEntry, len(rf.log[preLogIndex+1:]))
 			copy(entries, rf.log[preLogIndex+1:])
-			if preLogIndex < 0 {
-				fmt.Printf("[%d] preIndex is %d\n", rf.me, preLogIndex)
-			}
+
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				Leader:       rf.me,
@@ -467,8 +465,9 @@ func (rf *Raft) broadcastAppendEntries() {
 						rf.currentTerm = reply.Term
 						rf.change(Follower)
 					} else {
-						//TODO log unmatch
-						rf.nextIndex[server] -= 1
+						if rf.nextIndex[server] > 1 {
+							rf.nextIndex[server] -= 1
+						}
 					}
 				}
 			}
