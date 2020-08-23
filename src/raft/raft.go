@@ -34,7 +34,7 @@ const (
 	Candidater
 	Leader
 
-	AppendEntriesInterval = 10 * time.Millisecond
+	AppendEntriesInterval = 150 * time.Millisecond
 )
 
 //
@@ -177,10 +177,10 @@ func (rf *Raft) is(state int32) bool {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int32
-	CandidateId int
-	//LastLogIndex int
-	//LastLogTerm  int
+	Term         int32
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -213,20 +213,31 @@ type AppendEntriesReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm ||
+		(args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
 		reply.Term = rf.currentTerm
-	} else if args.Term > rf.currentTerm {
+		reply.VoteGranted = false
+		return
+	}
+
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.change(Follower)
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
-	} else {
-		if rf.votedFor == -1 {
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-		}
 	}
-	// only agree , reset timer
+
+	lastLogIndex := len(rf.log) - 1
+	if args.LastLogTerm < rf.log[lastLogIndex].Term ||
+		(args.LastLogTerm == rf.log[lastLogIndex].Term && args.LastLogIndex < lastLogIndex) {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	rf.votedFor = args.CandidateId
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = true
+	rf.timer.Reset(randDuration())
+
 	if reply.VoteGranted {
 		go func() {
 			rf.voteChannel <- struct{}{}
@@ -391,9 +402,12 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) broadcastVoteRequest() {
+	lastLogIndex := len(rf.log) - 1
 	args := RequestVoteArgs{
-		Term:        rf.term(),
-		CandidateId: rf.me,
+		Term:         rf.term(),
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  rf.log[lastLogIndex].Term,
 	}
 	for i := range rf.peers {
 		if i == rf.me {
@@ -404,10 +418,10 @@ func (rf *Raft) broadcastVoteRequest() {
 			if rf.is(Candidater) && rf.sendRequestVote(server, &args, &reply) {
 				rf.mu.Lock()
 				rf.mu.Unlock()
-				if reply.VoteGranted {
+				if reply.VoteGranted && rf.is(Candidater) {
 					rf.votedCount++
 				} else {
-					if reply.Term > rf.term() {
+					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.change(Follower)
 					}
@@ -476,11 +490,11 @@ func (rf *Raft) broadcastAppendEntries() {
 }
 
 func (rf *Raft) election() {
+	rf.timer.Reset(randDuration())
 	rf.incrementTerm()
 	rf.votedFor = rf.me
 
 	rf.votedCount = 1
-	rf.timer.Reset(randDuration())
 	rf.broadcastVoteRequest()
 }
 
@@ -523,6 +537,7 @@ func (rf *Raft) change(state int32) {
 	switch state {
 	case Follower:
 		rf.state = state
+		rf.timer.Reset(randDuration())
 		rf.votedFor = -1
 	case Candidater:
 		rf.state = state
@@ -534,7 +549,7 @@ func (rf *Raft) change(state int32) {
 			rf.nextIndex[i] = len(rf.log)
 		}
 		for i := range rf.matchIndex {
-			rf.matchIndex[i] = len(rf.log)
+			rf.matchIndex[i] = 0
 		}
 		fmt.Printf("[%d] change to [Leader]\n", rf.me)
 		rf.broadcastAppendEntries()
@@ -542,7 +557,7 @@ func (rf *Raft) change(state int32) {
 }
 
 func randDuration() time.Duration {
-	return time.Duration(rand.Int()%15+15) * 10 * time.Millisecond
+	return time.Duration(rand.Int()%50+50) * 10 * time.Millisecond
 }
 
 //
