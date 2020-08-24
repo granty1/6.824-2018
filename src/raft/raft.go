@@ -315,7 +315,7 @@ type AppendEntriesReply struct {
 	Term    int  // 2A
 	Success bool // 2A
 
-	// OPTIMIZE: see thesis section 5.3
+	// section 5.3
 	ConflictTerm  int // 2C
 	ConflictIndex int // 2C
 }
@@ -323,46 +323,48 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist() // execute before rf.mu.Unlock()
+	defer rf.persist()
+	// leader term < item term
+	// return false
+	// return item.term
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
 
+	// leader term > item term
+	// item term <- leader term
+	// convert to follower
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.convertTo(Follower)
-		// do not return here.
 	}
 
-	// reset election timer even log does not match
-	// args.LeaderId is the current term's Leader
+	// reset timer
 	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 
-	// entries before args.PrevLogIndex might be unmatch
-	// return false and ask Leader to decrement PrevLogIndex
+	// prevent out of range of rf.log
 	if len(rf.logs) < args.PrevLogIndex+1 {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		// optimistically thinks receiver's log matches with Leader's as a subset
+		// conflict index is item.logs length
 		reply.ConflictIndex = len(rf.logs)
-		// no conflict term
+		// term no conflict
 		reply.ConflictTerm = -1
 		return
 	}
 
+	// check term is match
 	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		// receiver's log in certain term unmatches Leader's log
+		// reply item's pre log term
 		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
-
 		// expecting Leader to check the former term
-		// so set ConflictIndex to the first one of entries in ConflictTerm
+		// set ConflictIndex to the first one of entries in ConflictTerm
 		conflictIndex := args.PrevLogIndex
-		// apparently, since rf.logs[0] are ensured to match among all servers
-		// ConflictIndex must be > 0, safe to minus 1
+		// conflictIndex must be > 0
 		for rf.logs[conflictIndex-1].Term == reply.ConflictTerm {
 			conflictIndex--
 		}
@@ -435,7 +437,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					rf.matchIndex[server] = args.PrevLogIndex + len(args.LogEntries)
 					rf.nextIndex[server] = rf.matchIndex[server] + 1
 
-					// check if we need to update commitIndex
+					// check if need to update commitIndex
 					// from the last log entry to committed one
 					for i := len(rf.logs) - 1; i > rf.commitIndex; i-- {
 						count := 0
@@ -458,7 +460,8 @@ func (rf *Raft) broadcastHeartbeat() {
 						rf.convertTo(Follower)
 						rf.persist()
 					} else {
-						// log unmatch, update nextIndex[server] for the next trial
+						// log unmatch
+						// update nextIndex[server] for the next trial
 						rf.nextIndex[server] = reply.ConflictIndex
 
 						// if term found, override it to
