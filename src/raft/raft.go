@@ -29,8 +29,8 @@ import "labgob"
 
 const (
 	HeartbeatInterval    = time.Duration(120) * time.Millisecond
-	ElectionTimeoutLower = time.Duration(300) * time.Millisecond
-	ElectionTimeoutUpper = time.Duration(400) * time.Millisecond
+	ElectionTimeoutLower = time.Duration(500) * time.Millisecond
+	ElectionTimeoutUpper = time.Duration(800) * time.Millisecond
 )
 
 type NodeState uint8
