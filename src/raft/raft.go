@@ -467,11 +467,13 @@ func (rf *Raft) broadcastHeartbeat() {
 						// if term found, override it to
 						// the first entry after entries in ConflictTerm
 						if reply.ConflictTerm != -1 {
-							for i := args.PrevLogIndex; i >= 1; i-- {
-								if rf.logs[i-1].Term == reply.ConflictTerm {
-									// in next trial, check if log entries in ConflictTerm matches
-									rf.nextIndex[server] = i
-									break
+							if args.PrevLogIndex <= len(rf.logs)-1 {
+								for i := args.PrevLogIndex; i >= 1; i-- {
+									if rf.logs[i-1].Term == reply.ConflictTerm {
+										// in next trial, check if log entries in ConflictTerm matches
+										rf.nextIndex[server] = i
+										break
+									}
 								}
 							}
 						}
